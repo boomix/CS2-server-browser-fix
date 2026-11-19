@@ -10,6 +10,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -132,17 +133,62 @@ def tray_image():
         return img
 
 
-def code_icon(size=22):
-    """Small </> glyph for the project-page button."""
-    S = size * 4
+_GITHUB_PATH = (
+    "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49"
+    "-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52"
+    ".28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18"
+    " 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07"
+    "-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38C13.71 14.53 16 11.54 16 8"
+    "c0-4.42-3.58-8-8-8z")
+
+
+def _github_points():
+    """Flatten the GitHub mark outline (16x16 box) into polygon points."""
+    toks = re.findall(r"[MCcz]|-?\d*\.?\d+", _GITHUB_PATH)
+    pts, i, cmd, cur = [], 0, "M", (0.0, 0.0)
+    while i < len(toks):
+        if toks[i] in "MCcz":
+            cmd = toks[i]
+            i += 1
+            if cmd == "z":
+                break
+        if cmd == "M":
+            cur = (float(toks[i]), float(toks[i + 1]))
+            pts.append(cur)
+            i += 2
+            cmd = "L"
+            continue
+        v = [float(t) for t in toks[i:i + 6]]
+        i += 6
+        if cmd == "c":
+            v = [v[0] + cur[0], v[1] + cur[1], v[2] + cur[0], v[3] + cur[1], v[4] + cur[0], v[5] + cur[1]]
+        p0, p1, p2, p3 = cur, (v[0], v[1]), (v[2], v[3]), (v[4], v[5])
+        for k in range(1, 9):
+            t = k / 8
+            u = 1 - t
+            pts.append((u ** 3 * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t ** 3 * p3[0],
+                        u ** 3 * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t ** 3 * p3[1]))
+        cur = p3
+    return pts
+
+
+def glyph(kind, size=20):
+    """Small white line icons drawn with PIL (pause, play, list, github mark)."""
+    S = size * 8
     im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
-    w = S // 9
-    c = (230, 237, 243, 255)
-    m = S // 2
-    d.line([(S * 0.36, S * 0.25), (S * 0.12, m), (S * 0.36, S * 0.75)], fill=c, width=w, joint="curve")
-    d.line([(S * 0.64, S * 0.25), (S * 0.88, m), (S * 0.64, S * 0.75)], fill=c, width=w, joint="curve")
-    d.line([(S * 0.56, S * 0.2), (S * 0.44, S * 0.8)], fill=c, width=w)
+    c = (240, 244, 248, 255)
+    if kind == "pause":
+        d.rounded_rectangle((S * .22, S * .15, S * .42, S * .85), radius=S * .05, fill=c)
+        d.rounded_rectangle((S * .58, S * .15, S * .78, S * .85), radius=S * .05, fill=c)
+    elif kind == "play":
+        d.polygon([(S * .25, S * .12), (S * .85, S * .5), (S * .25, S * .88)], fill=c)
+    elif kind == "list":  # server browser: window with rows
+        d.rounded_rectangle((S * .08, S * .14, S * .92, S * .86), radius=S * .1, outline=c, width=int(S * .07))
+        for y in (.36, .53, .70):
+            d.line([(S * .24, S * y), (S * .76, S * y)], fill=c, width=int(S * .07))
+    elif kind == "github":
+        d.polygon([(x / 16 * S, y / 16 * S) for x, y in _github_points()], fill=c)
     small = im.resize((size, size), Image.LANCZOS)
     return ctk.CTkImage(light_image=small, dark_image=small, size=(size, size))
 
@@ -312,14 +358,17 @@ class App(ctk.CTk):
         self.status_dot = ctk.CTkLabel(titles, text="● Starting...", text_color=GRAY,
                                        font=ctk.CTkFont(size=13, weight="bold"))
         self.status_dot.pack(anchor="w")
-        ctk.CTkButton(head, text="Open server browser", width=170, height=38, corner_radius=10,
+        self.ic_list = glyph("list")
+        self.ic_pause, self.ic_play = glyph("pause"), glyph("play")
+        ctk.CTkButton(head, text=" Open server browser", image=self.ic_list, compound="left",
+                      width=190, height=38, corner_radius=10,
                       font=ctk.CTkFont(size=14, weight="bold"), command=self.open_steam_browser).grid(
             row=0, column=1, padx=6)
-        self.btn = ctk.CTkButton(head, text="Pause", width=90, height=38, corner_radius=10,
+        self.btn = ctk.CTkButton(head, text=" Pause", image=self.ic_pause, compound="left", width=105, height=38, corner_radius=10,
                                  fg_color="#4b5563", hover_color="#374151",
                                  font=ctk.CTkFont(size=14, weight="bold"), command=self.toggle)
         self.btn.grid(row=0, column=2, padx=(0, 6))
-        self.gh_icon = code_icon()
+        self.gh_icon = glyph("github", 24)
         ctk.CTkButton(head, text="", image=self.gh_icon, width=38, height=38, corner_radius=10,
                       fg_color="#374151", hover_color="#4b5563",
                       command=lambda: os.startfile(REPO_URL)).grid(row=0, column=3, padx=(0, 18))
@@ -337,7 +386,7 @@ class App(ctk.CTk):
         self.build_home(self.tabs.tab("Home"))
         self.build_countries(self.tabs.tab("Countries"))
         self.build_advanced(self.tabs.tab("Advanced"))
-        ctk.CTkLabel(self, text=f"v{__version__}  ·  Country data by DB-IP.com  ·  Not affiliated with Valve  ·  </> = project page",
+        ctk.CTkLabel(self, text=f"v{__version__}  ·  Country data by DB-IP.com  ·  Not affiliated with Valve  ·  Project page: top-right icon",
                      text_color=GRAY, font=ctk.CTkFont(size=11)).grid(row=2, column=0, pady=(0, 8))
         self.log("Filtering is always on. Changes to settings apply automatically.")
 
@@ -496,9 +545,9 @@ class App(ctk.CTk):
         win = canvas.create_window(0, 0, window=self.cscroll, anchor="nw")
         self.cscroll.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
-        canvas.bind("<Enter>", lambda e: canvas.bind_all(
-            "<MouseWheel>", lambda ev: canvas.yview_scroll(int(-ev.delta / 120) * 2, "units")))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self.wheel_target = canvas
+        for w in (canvas, self.cscroll):
+            w.bind("<MouseWheel>", self.country_wheel)
         for c in range(3):
             self.cscroll.grid_columnconfigure(c, weight=1, uniform="c")
         self.cvars, self.cboxes, self.flag_imgs = {}, {}, []
@@ -519,7 +568,12 @@ class App(ctk.CTk):
                 self.cscroll, text=f" {COUNTRIES[cc]}{dist}", image=img, compound="left", variable=var,
                 bg=BG, fg=FG, activebackground=BG, activeforeground=FG, selectcolor="#3a3a3a",
                 anchor="w", bd=0, highlightthickness=0, padx=4, pady=3)
+            self.cboxes[cc].bind("<MouseWheel>", self.country_wheel)
         self.filter_countries()
+
+    def country_wheel(self, ev):
+        self.wheel_target.yview_scroll(int(-ev.delta / 120) * 2, "units")
+        return "break"
 
     def filter_countries(self):
         q = self.search.get().strip().lower()
@@ -592,12 +646,12 @@ class App(ctk.CTk):
         """Pause / resume."""
         if self.paused:
             self.paused = False
-            self.btn.configure(text="Pause", fg_color="#4b5563", hover_color="#374151")
+            self.btn.configure(text=" Pause", image=self.ic_pause, fg_color="#4b5563", hover_color="#374151")
             self.start()
         else:
             self.paused = True
             self.restart_pending = False
-            self.btn.configure(text="Resume", fg_color=PRIMARY, hover_color=PRIMARY_HOVER)
+            self.btn.configure(text=" Resume", image=self.ic_play, fg_color=PRIMARY, hover_color=PRIMARY_HOVER)
             self.stop()
             self.set_status("Paused - nothing is filtered", AMBER)
 

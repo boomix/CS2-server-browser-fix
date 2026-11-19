@@ -13,7 +13,7 @@ Open the browser, refresh, and see real servers instead of lists full of `255/25
 - **Keeps real servers**, including ones with a few bots.
 - **Tidy names**: one style for all servers, `flag  Mode | Name`. The game mode is detected (DM, Retake, Surf, Bhop, ...), emoji clutter and old `[RU]` tags are removed, and the real country comes from the server's IP address.
 - **Country filter**: hide or allow whole countries, sorted closest to you first, with flags.
-- **Always on** in the system tray. It restarts itself when you change a setting and can start with Windows.
+- **Runs in the system tray.** It restarts itself when you change a setting. It can start with Windows and filter only while Steam (or CS2) is running.
 - **Open server browser** button, so you can jump straight to Steam's list.
 
 It works with the normal Steam server browser (*View → Game Servers*, or the button in the app). Nothing in the game or Steam is modified.

@@ -14,24 +14,25 @@ if not os.path.exists("assets/icon.ico"):
     subprocess.check_call([sys.executable, "make_icon.py"])
 subprocess.check_call([sys.executable, "src/a2s_filter.py", "--selftest"])
 
-for d in ("build", "release"):
+OUT = sys.argv[1] if len(sys.argv) > 1 else "release"   # e.g. "python build.py release-next" if the old exe is running
+for d in ("build", OUT):
     shutil.rmtree(d, ignore_errors=True)
 subprocess.check_call([
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--uac-admin",
     "--name", "CS2ServerFilter", "--icon", os.path.abspath("assets/icon.ico"), "--paths", "src",
-    "--distpath", "release", "--workpath", "build/work", "--specpath", "build",
+    "--distpath", OUT, "--workpath", "build/work", "--specpath", "build",
     "--collect-all", "customtkinter", "--collect-all", "pydivert", "--hidden-import", "pystray._win32",
     "--add-data", os.path.abspath("assets") + os.pathsep + "assets",
     os.path.abspath("src/a2s_gui.py")])
 
-exe = "release/CS2ServerFilter.exe"
-zname = f"release/CS2ServerFilter-v{version}-win64.zip"
+exe = f"{OUT}/CS2ServerFilter.exe"
+zname = f"{OUT}/CS2ServerFilter-v{version}-win64.zip"
 with zipfile.ZipFile(zname, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(exe, "CS2ServerFilter.exe")
     for f in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
         z.write(f, f)
-with open("release/SHA256SUMS.txt", "w") as out:
+with open(f"{OUT}/SHA256SUMS.txt", "w") as out:
     for f in (exe, zname):
         out.write(f"{hashlib.sha256(open(f, 'rb').read()).hexdigest()}  {os.path.basename(f)}\n")
 shutil.rmtree("build", ignore_errors=True)
-print("built", version, [(f, os.path.getsize("release/" + f)) for f in os.listdir("release")])
+print("built", version, [(f, os.path.getsize(f"{OUT}/" + f)) for f in os.listdir(OUT)])

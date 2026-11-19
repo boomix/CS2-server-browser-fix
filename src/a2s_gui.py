@@ -104,6 +104,36 @@ def relaunch_as_admin():
     return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, APP_DIR, 1) > 32
 
 
+def running_processes():
+    """Lower-case names of all running processes (Toolhelp snapshot, no subprocess)."""
+    from ctypes import wintypes
+
+    class PE(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+    k = ctypes.windll.kernel32
+    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snap = k.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    names = set()
+    try:
+        pe = PE()
+        pe.dwSize = ctypes.sizeof(PE)
+        ok = k.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            names.add(pe.szExeFile.lower())
+            ok = k.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        k.CloseHandle(snap)
+    return names
+
+
+RUN_MODES = {"Always": None, "While Steam is open": {"steam.exe"}, "While CS2 is running": {"cs2.exe"}}
+
+
 def autostart_command():
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}" --minimized'
@@ -207,6 +237,7 @@ def flag_photo(cc, box=(24, 16)):
 
 DEFAULTS = {
     "autostart": False,
+    "run_when": "Always",
     "hide_fakes": True,
     "rules": {k: True for k, _, _ in RULES},
     "max_valid": 64, "max_per_ip": 10, "max_same_name": 3, "port_range": "26000-28999",
@@ -232,6 +263,7 @@ class App(ctk.CTk):
         self.cmdq = queue.Queue()
         self.counts = {}
         self.paused = False
+        self.gate_ok = True
         self.loading = True
         self.restart_job = None
         self.restart_pending = False
@@ -242,8 +274,10 @@ class App(ctk.CTk):
         self.after(150, self.pump_log)
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.start_tray()
+        self.check_gate(initial=True)
         if is_admin():
             self.after(300, self.start)
+        self.after(3000, self.poll_gate)
         if "--minimized" in sys.argv and self.tray:
             self.after(500, self.withdraw)
 
@@ -306,10 +340,36 @@ class App(ctk.CTk):
             self.after_cancel(self.restart_job)
         self.restart_job = self.after(1200, self.apply_now)
 
+    def check_gate(self, initial=False):
+        """Filtering only runs while the chosen program (Steam / CS2) is running."""
+        need = RUN_MODES.get(self.run_var.get())
+        ok = True if not need else bool(need & running_processes())
+        changed = ok != self.gate_ok
+        self.gate_ok = ok
+        if initial or not changed:
+            return
+        if ok:
+            if not self.paused:
+                self.start()
+        else:
+            self.stop()
+            self.set_status(self.waiting_text(), AMBER)
+
+    def waiting_text(self):
+        return "Waiting for CS2 to start" if "CS2" in self.run_var.get() else "Waiting for Steam to start"
+
+    def poll_gate(self):
+        try:
+            self.check_gate()
+        except Exception:
+            pass
+        self.after(3000, self.poll_gate)
+
     def apply_now(self):
         self.restart_job = None
         self.save_settings()
-        if self.paused or not is_admin():
+        self.check_gate()
+        if self.paused or not is_admin() or not self.gate_ok:
             return
         if self.thread and self.thread.is_alive():
             self.restart_pending = True
@@ -413,7 +473,16 @@ class App(ctk.CTk):
         self.auto_var = ctk.BooleanVar(value=self.s["autostart"])
         self.switch_row(card, "Start with Windows", self.auto_var,
                         "Runs quietly in the system tray after you log in.", command=self.toggle_autostart)
-        ctk.CTkLabel(card, text="").pack(pady=2)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(row, text="Filter", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        self.run_var = self.watch(ctk.StringVar(value=self.s["run_when"] if self.s["run_when"] in RUN_MODES
+                                                else "Always"))
+        ctk.CTkSegmentedButton(row, values=list(RUN_MODES), variable=self.run_var, width=430).pack(
+            side="left", padx=14)
+        ctk.CTkLabel(card, text="Use \"While Steam is open\" with Start with Windows: the app waits quietly in the tray "
+                                "and only filters while Steam is running.",
+                     text_color=GRAY, wraplength=680, justify="left").pack(anchor="w", padx=14, pady=(2, 12))
         self.stats = ctk.CTkLabel(tab, text="", text_color=GRAY, font=ctk.CTkFont(size=13))
         self.stats.pack(anchor="w", padx=16, pady=(8, 0))
         ctk.CTkLabel(tab, text="Tip: pick countries to hide in the Countries tab, then press "
@@ -597,6 +666,7 @@ class App(ctk.CTk):
     # ----------------------------------------------------------- control
     def collect(self):
         self.s["autostart"] = self.auto_var.get()
+        self.s["run_when"] = self.run_var.get()
         self.s["hide_fakes"] = self.hide_var.get()
         self.s["simplify"] = self.simplify_var.get()
         self.s["country_prefix"] = self.flag_var.get()
@@ -670,6 +740,9 @@ class App(ctk.CTk):
         if not is_admin():
             self.set_status("Needs Administrator rights", RED)
             return
+        if not self.gate_ok:
+            self.set_status(self.waiting_text(), AMBER)
+            return
         self.save_settings()
         try:
             a = self.build_args()
@@ -728,7 +801,7 @@ class App(ctk.CTk):
                         self.restart_pending = False
                         self.log("Settings changed - filter restarted.")
                         self.after(200, self.start)
-                    elif not self.paused:
+                    elif not self.paused and self.gate_ok:
                         self.set_status("Stopped", GRAY)
                     continue
                 tag = ""

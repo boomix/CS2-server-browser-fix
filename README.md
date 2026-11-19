@@ -79,6 +79,18 @@ python build.py                          # builds release/CS2ServerFilter.exe an
 
 Engine only, no window: `python src/a2s_filter.py` from an elevated terminal (default settings).
 
+## Code signing policy
+
+Free code signing for the released exe is provided by [SignPath.io](https://signpath.io), with the certificate issued by the [SignPath Foundation](https://signpath.org). (Applies once signing is set up; see the release notes for whether a given release is signed.)
+
+- **Author, reviewer and approver:** [boomix](https://github.com/boomix) (repository owner). Every signing request is approved manually.
+- Only binaries built by the GitHub Actions workflow in this repository from its own source are signed.
+- Two-factor authentication is required for the GitHub and SignPath accounts.
+
+## Privacy
+
+The app does not collect or send any personal data, and has no telemetry or update check. Its only network traffic is the player-list query it sends to game servers that already appear in your Steam server list. Country lookups use a database stored inside the app, so no IP address is sent anywhere. Settings stay on your PC in `%APPDATA%\CS2ServerFilter`.
+
 ## Credits
 
 Country data: [IP Geolocation by DB-IP](https://db-ip.com) (CC BY 4.0). Flags: [flagcdn.com](https://flagcdn.com). Packet capture: WinDivert. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -38,7 +38,13 @@ It works with the normal Steam server browser (*View → Game Servers*, or the b
 2. Run it and accept the Administrator prompt. Packet filtering needs it.
 3. Press **Open server browser** and refresh the list.
 
-Windows may show a SmartScreen warning because the file is not code-signed. Choose *More info → Run anyway*. Some antivirus programs dislike packet-filter drivers; the exe is built from the source in this repository (see below).
+**"Windows protected your PC" / "Unknown publisher":** the exe is not code-signed yet (a signing certificate costs money), so Windows SmartScreen and the Administrator prompt warn about an unknown publisher. Choose *More info → Run anyway*. This is normal for small open-source tools. To check the file is genuine:
+
+- compare its SHA-256 with `SHA256SUMS.txt` on the release page (`Get-FileHash CS2ServerFilter.exe` in PowerShell), or
+- verify the build provenance: `gh attestation verify CS2ServerFilter.exe --repo boomix/CS2-server-browser-fix` (proves GitHub built it from this repository), or
+- build it yourself from the source (see below).
+
+Some antivirus programs dislike packet-filter drivers (the app uses WinDivert); it is a false positive.
 
 Settings are stored in `%APPDATA%\CS2ServerFilter`.
 

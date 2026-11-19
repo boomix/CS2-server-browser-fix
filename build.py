@@ -17,9 +17,28 @@ subprocess.check_call([sys.executable, "src/a2s_filter.py", "--selftest"])
 OUT = sys.argv[1] if len(sys.argv) > 1 else "release"   # e.g. "python build.py release-next" if the old exe is running
 for d in ("build", OUT):
     shutil.rmtree(d, ignore_errors=True)
+# Windows "Details" tab / installer-style metadata (shown in file properties and the UAC prompt)
+os.makedirs("build", exist_ok=True)
+v = tuple(int(x) for x in version.split(".")) + (0,) * (4 - len(version.split(".")))
+open("build/version_info.txt", "w", encoding="utf8").write(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={v}, prodvers={v}, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'boomix'),
+      StringStruct('FileDescription', 'CS2 Server Browser Fix - hides fake servers from the Steam server browser'),
+      StringStruct('FileVersion', '{version}'),
+      StringStruct('InternalName', 'CS2ServerFilter'),
+      StringStruct('LegalCopyright', 'Copyright (c) 2026 boomix. MIT License.'),
+      StringStruct('OriginalFilename', 'CS2ServerFilter.exe'),
+      StringStruct('ProductName', 'CS2 Server Browser Fix'),
+      StringStruct('ProductVersion', '{version}')])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ])
+""")
 subprocess.check_call([
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--uac-admin",
-    "--name", "CS2ServerFilter", "--icon", os.path.abspath("assets/icon.ico"), "--paths", "src",
+    "--name", "CS2ServerFilter", "--icon", os.path.abspath("assets/icon.ico"),
+    "--version-file", os.path.abspath("build/version_info.txt"), "--paths", "src",
     "--distpath", OUT, "--workpath", "build/work", "--specpath", "build",
     "--collect-all", "customtkinter", "--collect-all", "pydivert", "--hidden-import", "pystray._win32",
     "--add-data", os.path.abspath("assets") + os.pathsep + "assets",

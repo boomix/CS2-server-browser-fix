@@ -1,0 +1,35 @@
+name: Build release
+
+# Push a tag like v1.0.0 and this builds the exe on GitHub's own runner from the code in the tag,
+# then attaches it to a GitHub Release. Anyone can verify the exe came from this source.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python build.py
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: release/CS2ServerFilter.exe
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release/CS2ServerFilter.exe
+            release/CS2ServerFilter-*-win64.zip
+            release/SHA256SUMS.txt
+          generate_release_notes: true

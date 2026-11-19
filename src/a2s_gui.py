@@ -240,9 +240,8 @@ DEFAULTS = {
     "run_when": "Always",
     "hide_fakes": True,
     "rules": {k: True for k, _, _ in RULES},
-    "max_valid": 64, "max_per_ip": 10, "max_same_name": 3, "port_range": "26000-28999",
-    "probe": True, "strict": False, "padded": "show", "shared_names": False, "use_blocklist": False,
-    "simplify": True, "strip_emoji": True, "country_prefix": True, "flag_style": "emoji",
+    "port_range": "26000-28999", "padded": "show",
+    "simplify": True, "country_prefix": True, "flag_style": "emoji",
     "country_mode": "block", "countries": [],
 }
 
@@ -520,53 +519,29 @@ class App(ctk.CTk):
             ctk.CTkSwitch(scroll, text=label, variable=v).pack(anchor="w", padx=8, pady=(8, 0))
             ctk.CTkLabel(scroll, text=tip, text_color=GRAY, wraplength=620, justify="left").pack(
                 anchor="w", padx=(52, 8))
-        self.v = {}
-
-        def entry(label, key, width=110):
-            fr = ctk.CTkFrame(scroll, fg_color="transparent")
-            fr.pack(fill="x", padx=8, pady=4)
-            ctk.CTkLabel(fr, text=label, anchor="w").pack(side="left")
-            self.v[key] = self.watch(ctk.StringVar(value=str(self.s[key])))
-            ctk.CTkEntry(fr, textvariable=self.v[key], width=width, justify="center").pack(side="right")
-
-        def switch(label, key, hint=None):
-            self.v[key] = self.watch(ctk.BooleanVar(value=self.s[key]))
-            ctk.CTkSwitch(scroll, text=label, variable=self.v[key]).pack(anchor="w", padx=8, pady=(8, 0))
-            if hint:
-                ctk.CTkLabel(scroll, text=hint, text_color=GRAY, wraplength=620, justify="left").pack(
-                    anchor="w", padx=(52, 8))
-
         ctk.CTkLabel(scroll, text="Settings", font=ctk.CTkFont(size=14, weight="bold")).pack(
             anchor="w", padx=8, pady=(18, 0))
-        entry("Port range (or 'any')", "port_range")
-        entry("Largest believable max players", "max_valid", 70)
-        entry("Max ports per IP", "max_per_ip", 70)
-        entry("Same name on this many IPs = spam", "max_same_name", 70)
+        fr = ctk.CTkFrame(scroll, fg_color="transparent")
+        fr.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(fr, text="Port range (or 'any')", anchor="w").pack(side="left")
+        self.port_var = self.watch(ctk.StringVar(value=str(self.s["port_range"])))
+        ctk.CTkEntry(fr, textvariable=self.port_var, width=110, justify="center").pack(side="right")
         fr = ctk.CTkFrame(scroll, fg_color="transparent")
         fr.pack(fill="x", padx=8, pady=4)
         ctk.CTkLabel(fr, text="Servers with fake padding", anchor="w").pack(side="left")
-        self.v["padded"] = self.watch(ctk.StringVar(value=self.s["padded"]))
-        ctk.CTkSegmentedButton(fr, values=["show", "drop"], variable=self.v["padded"], width=130).pack(side="right")
+        self.padded_var = self.watch(ctk.StringVar(value=self.s["padded"]))
+        ctk.CTkSegmentedButton(fr, values=["show", "drop"], variable=self.padded_var, width=130).pack(side="right")
         ctk.CTkLabel(scroll, text="show = keep them with the real player count.   drop = hide them.",
                      text_color=GRAY, wraplength=620, justify="left").pack(anchor="w", padx=8)
-        switch("Check player lists (probe servers)", "probe",
-               "Needed by most rules above. Adds ~1s the first time a server is seen.")
-        switch("Also hide servers that never answer the probe", "strict")
-        switch("Detect copied player names across servers", "shared_names")
-        switch("Remember spam-farm IPs between runs", "use_blocklist", "Saved next to the settings file.")
 
     def build_names(self, tab):
         card = ctk.CTkFrame(tab, corner_radius=12)
         card.pack(fill="x", padx=6, pady=6)
-        self.n = {}
-        self.n["strip_emoji"] = self.watch(ctk.BooleanVar(value=self.s["strip_emoji"]))
-        self.switch_row(card, "Remove emoji and symbols", self.n["strip_emoji"],
-                        "Cleans decorations such as ➥███ and ✪ from names.")
         fr = ctk.CTkFrame(card, fg_color="transparent")
         fr.pack(anchor="w", padx=14, pady=(14, 4))
         ctk.CTkLabel(fr, text="Country style:").pack(side="left")
-        self.n["flag_style"] = self.watch(ctk.StringVar(value=self.s["flag_style"]))
-        ctk.CTkSegmentedButton(fr, values=["emoji", "text"], variable=self.n["flag_style"], width=160).pack(
+        self.style_var = self.watch(ctk.StringVar(value=self.s["flag_style"]))
+        ctk.CTkSegmentedButton(fr, values=["emoji", "text"], variable=self.style_var, width=160).pack(
             side="left", padx=10)
         ctk.CTkLabel(card, text="emoji = flag emoji + icons (Steam on Windows may show flags as two letters).\n"
                                 "text = [LV] and [WS].", text_color=GRAY, justify="left").pack(
@@ -671,43 +646,24 @@ class App(ctk.CTk):
         self.s["simplify"] = self.simplify_var.get()
         self.s["country_prefix"] = self.flag_var.get()
         self.s["rules"] = {k: v.get() for k, v in self.rule_vars.items()}
-        for k, var in self.v.items():
-            val = var.get()
-            if k in ("max_valid", "max_per_ip", "max_same_name"):
-                try:
-                    val = max(1, int(val))
-                except ValueError:
-                    val = DEFAULTS[k]
-            self.s[k] = val
-        for k, var in self.n.items():
-            self.s[k] = var.get()
+        self.s["port_range"] = self.port_var.get()
+        self.s["padded"] = self.padded_var.get()
+        self.s["flag_style"] = self.style_var.get()
         self.s["country_mode"] = "block" if self.cmode.get() == "Hide ticked" else "allow"
         self.s["countries"] = sorted(c for c, v in self.cvars.items() if v.get())
 
-    def build_args(self):
+    def build_config(self):
         s = self.s
-        a = a2s_filter.build_parser().parse_args([])
-        a.enforce = True
-        off = {k for k, _, _ in RULES} if not s["hide_fakes"] else {k for k, on in s["rules"].items() if not on}
-        a.disable = off
-        a.port_range = str(s["port_range"]).strip() or "any"
-        a.max_valid, a.max_per_ip, a.max_same_name = s["max_valid"], s["max_per_ip"], s["max_same_name"]
-        a.padded = s["padded"]
-        a.no_probe = not s["probe"]
-        a.strict = s["strict"]
-        a.shared_names = s["shared_names"]
-        a.no_blocklist = not s["use_blocklist"]
-        a.blocklist = os.path.join(DATA_DIR, "blocked_ips.txt")
-        a.geo_file = a2s_filter.asset_path("geo", "dbip.csv.gz")
-        a.simplify = s["simplify"]
-        a.keep_emoji = not s["strip_emoji"]
-        a.no_flags = not s["country_prefix"]
-        a.rewrite = s["simplify"] or s["strip_emoji"] or s["country_prefix"]
-        a.flag_style = s["flag_style"]
         cc = set(s["countries"])
-        a.block_countries = cc if s["country_mode"] == "block" else set()
-        a.allow_countries = cc if s["country_mode"] == "allow" else set()
-        return a
+        return a2s_filter.Config(
+            disabled={k for k, _, _ in RULES} if not s["hide_fakes"] else {k for k, on in s["rules"].items() if not on},
+            port_range=a2s_filter.parse_port_range(str(s["port_range"])),  # ValueError if malformed
+            padded=s["padded"],
+            tidy_names=s["simplify"],
+            country_prefix=s["country_prefix"],
+            flag_style=s["flag_style"],
+            block_countries=cc if s["country_mode"] == "block" else set(),
+            allow_countries=cc if s["country_mode"] == "allow" else set())
 
     def set_status(self, text, color):
         self.status_dot.configure(text="● " + text, text_color=color)
@@ -745,21 +701,18 @@ class App(ctk.CTk):
             return
         self.save_settings()
         try:
-            a = self.build_args()
-            if a.port_range.lower() != "any":
-                x, y = a.port_range.split("-")
-                int(x), int(y)
-        except Exception:
+            cfg = self.build_config()
+        except ValueError:
             messagebox.showerror("Settings", "Port range must look like 26000-28999 or 'any'.")
             return
         self.handle_box = {}
-        self.thread = threading.Thread(target=self.worker, args=(a,), daemon=True)
+        self.thread = threading.Thread(target=self.worker, args=(cfg,), daemon=True)
         self.thread.start()
         self.set_status("Filtering is on", GREEN)
 
-    def worker(self, a):
+    def worker(self, cfg):
         try:
-            a2s_filter.run(a, out=self.logq.put, handle_box=self.handle_box)
+            a2s_filter.run(cfg, out=self.logq.put, handle_box=self.handle_box)
         except Exception as e:
             self.logq.put(f"ERROR: {e!r}")
         self.logq.put("__stopped__")

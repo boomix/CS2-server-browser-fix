@@ -1,41 +1,42 @@
 """
-a2s_filter.py - drop fake Source-engine server replies before Steam sees them.
+a2s_filter.py - the engine: drops fake Source-engine server replies before Steam sees them.
 
-Steam's server browser sends A2S_INFO queries over UDP and servers answer with
-name/map/players/max players. Fake servers lie in that reply.
-This tool uses WinDivert (via pydivert) to intercept inbound A2S_INFO replies
-and validate them before Steam gets to see them:
+Steam's server browser sends A2S_INFO queries over UDP and every server answers with
+name / map / players / max players. Fake servers lie in that reply. This module uses
+WinDivert (via pydivert) to catch the replies and check each one before Steam reads it:
 
-  1. Sanity rules  - max players > 64, players > max, 255 players, ...
-  2. Active probe  - the reply is held, we query the server ourselves with
-                     A2S_PLAYER and check that the real player list matches
-                     the advertised player count (fakes usually can't).
-  3. Duplicate     - many addresses advertising the same server name, or too
-     rules           many ports on one IP, are treated as spam farms.
+  1. Sanity     - impossible numbers (max players > 64, 255 players, ...)
+  2. Probe      - the reply is held while we ask the server for its real player list
+                  (A2S_PLAYER) and compare it with the advertised count; padded lists
+                  (identical join times, random-case names) are detected
+  3. Identity   - the server must answer from the port it claims, one SteamID = one address
+  4. Duplicates - one name on many IPs, or many ports on one IP, is a spam farm
 
-Run from an ELEVATED terminal:
-    python src/a2s_filter.py              # dry-run: only logs what it WOULD drop
-    python src/a2s_filter.py --enforce    # actually drops fake replies
+Fake replies are dropped; names and player counts of the rest are rewritten.
+
+    python src/a2s_filter.py              # run with defaults (needs an elevated terminal)
     python src/a2s_filter.py --selftest   # rule tests, no admin needed
 """
-import argparse
-import os as _os
-
-
-def asset_path(*parts):
-    """assets/ folder: next to src/ when run from source, inside the bundle when frozen."""
-    import sys as _sys
-    base = getattr(_sys, "_MEIPASS", None) or _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..")
-    return _os.path.normpath(_os.path.join(base, "assets", *parts))
-
-
+import bisect
+import gzip
+import os
 import queue
+import re
 import socket
 import struct
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+
+def asset_path(*parts):
+    """assets/ folder: next to src/ when run from source, inside the bundle when frozen."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    return os.path.normpath(os.path.join(base, "assets", *parts))
+
 
 HEADER = b"\xff\xff\xff\xff"
 CLUSTER_WINDOW = 700    # seconds: fake connect times are spread over ~600s
@@ -44,7 +45,7 @@ CLUSTER_MIN_AGE = 900   # seconds: only players connected at least this long cou
 
 # ---------------------------------------------------------------- parsing
 def parse_a2s_info(payload):
-    """Return dict(name, map, players, max_players, bots, appid) or None."""
+    """Return dict(name, map, players, max_players, bots, gameport, steamid) or None."""
     if len(payload) < 6 or payload[:4] != HEADER or payload[4] != 0x49:
         return None
     try:
@@ -54,11 +55,10 @@ def parse_a2s_info(payload):
             end = payload.index(b"\x00", pos)
             fields.append(payload[pos:end].decode("utf-8", "replace"))
             pos = end + 1
-        appid, players, max_players, bots = struct.unpack_from("<HBBB", payload, pos)
+        _appid, players, max_players, bots = struct.unpack_from("<HBBB", payload, pos)
         pos += 5
-        info = {"name": fields[0], "map": fields[1], "game": fields[3], "appid": appid,
-                "players": players, "max_players": max_players, "bots": bots,
-                "gameport": None, "steamid": None}
+        info = {"name": fields[0], "map": fields[1], "players": players, "max_players": max_players,
+                "bots": bots, "gameport": None, "steamid": None}
         try:  # extra data flag (EDF) block: real servers advertise their own port + steamid
             pos += 4  # server type, environment, visibility, VAC
             pos = payload.index(b"\x00", pos) + 1  # version string
@@ -217,11 +217,6 @@ def padding_indices(info, plist):
     return flagged
 
 
-def padding_size(info, plist):
-    """Number of fake 'players' in the list, or 0 when the list looks normal."""
-    return len(padding_indices(info, plist))
-
-
 def players_reason(info, plist, drop_padding=True, skip=frozenset()):
     """Compare the advertised player count with the real A2S_PLAYER list.
     `skip` may contain 'mismatch', 'names', 'padding' to disable those checks."""
@@ -238,7 +233,7 @@ def players_reason(info, plist, drop_padding=True, skip=frozenset()):
                 return f"only {len(set(names))} unique names in {n} players"
             if len(set(round(x[2], 1) for x in plist)) == 1 and len(set(x[1] for x in plist)) == 1:
                 return "all players have identical score and time"
-        pad = 0 if "padding" in skip else padding_size(info, plist)
+        pad = 0 if "padding" in skip else len(padding_indices(info, plist))
         if pad and drop_padding:
             return f"{pad} of {n} players connected at nearly the same time (bots={bots})"
     return None
@@ -254,97 +249,37 @@ def rewrite_info_players(payload, players):
 
 
 class DupTracker:
-    """Flags spam farms: same name on many addresses / many ports per IP."""
+    """Flags spam farms: the same name on many IPs, or many ports on one IP."""
 
-    def __init__(self, max_same_name, max_per_ip, blocklist_file=None):
+    def __init__(self, max_same_name, max_per_ip):
         self.max_same_name = max_same_name
         self.max_per_ip = max_per_ip
         self.names = {}   # name stem -> set(addr)
         self.ips = {}     # ip -> set(port)
-        self.bad_ips = set()
-        self.file = blocklist_file
         self.lock = threading.Lock()
-        if self.file:
-            try:
-                with open(self.file) as f:
-                    self.bad_ips = {l.strip() for l in f if l.strip()}
-            except OSError:
-                pass
 
     @staticmethod
     def stem(name):
         """'FB-CS.RU | DUST2 #1' and '... #7' share one stem: digits/#/punctuation ignored."""
         return "".join(c for c in name.lower() if c.isalpha())
 
-    def _block(self, ips):
-        if not self.file:  # --no-blocklist: judge each reply on its own, remember nothing
-            return
-        new = set(ips) - self.bad_ips
-        if new:
-            self.bad_ips |= new
-            if self.file:
-                try:
-                    with open(self.file, "a") as f:
-                        f.writelines(i + "\n" for i in sorted(new))
-                except OSError:
-                    pass
-
     def check(self, addr, name):
         ip, port = addr
         key = self.stem(name) or name.lower()
         with self.lock:
-            if ip in self.bad_ips:
-                return f"{ip} was flagged as a spam farm earlier (blocked_ips.txt)"
             s = self.names.setdefault(key, set())
             s.add(addr)
             ports = self.ips.setdefault(ip, set())
             ports.add(port)
             same_ips = {a[0] for a in s}  # a host running #1,#2,#3 on ONE ip is normal
             if len(same_ips) >= self.max_same_name:
-                self._block(same_ips)
                 return f"name '{name[:30]}' seen on {len(same_ips)} different IPs"
             if len(ports) > self.max_per_ip:
-                self._block([ip])
                 return f"{len(ports)} ports advertised on {ip}"
         return None
 
 
-class NameShare:
-    """Fake servers copy player names between each other. A real player can
-    not be on several servers at once, so flag servers whose player names are
-    mostly also listed on other servers."""
-
-    IGNORE = {"", "player", "unnamed", "unconnected"}
-
-    def __init__(self, min_servers, fraction):
-        self.min_servers = min_servers  # name on this many OTHER servers counts as shared
-        self.fraction = fraction
-        self.where = {}  # name -> set(addr)
-        self.lock = threading.Lock()
-
-    def check(self, addr, names):
-        names = [n for n in names if n.strip().lower() not in self.IGNORE]
-        if len(names) < 4:
-            return None
-        with self.lock:
-            shared = 0
-            for n in set(names):
-                s = self.where.setdefault(n, set())
-                s.add(addr)
-                if len(s - {addr}) >= self.min_servers:
-                    shared += 1
-            frac = shared / len(set(names))
-        if frac >= self.fraction:
-            return f"{shared}/{len(set(names))} player names also on other servers"
-        return None
-
-
 # ------------------------------------------------- name cleanup + country
-import bisect
-import gzip
-import os
-import unicodedata
-
 _DROP_CATS = {"So", "Cf", "Cs", "Co", "Cn", "Cc"}
 
 
@@ -358,8 +293,6 @@ def strip_name(name):
         out.append(c)
     return " ".join("".join(out).split())
 
-
-import re
 
 REGION_TAGS = {"EU", "CIS", "NA", "SA", "ASIA", "EUROPE", "WORLD", "INT", "GLOBAL"}
 _CS2_RE = re.compile(r"(?<![\w.@-])(?:cs\s?2|cs:?\s?go|counter[\s-]?strike(?:\s?2)?)(?![\w.])", re.I)
@@ -547,6 +480,9 @@ class Prober:
 
 # --------------------------------------------------------------- selftest
 def selftest():
+    def _pad_count(info, plist):
+        return len(padding_indices(info, plist))
+
     def info_pkt(name, players, mx, bots=0):
         return (HEADER + b"I" + b"\x11" + name.encode() + b"\0de_dust2\0csgo\0Counter-Strike 2\0"
                 + struct.pack("<HBBB", 730, players, mx, bots) + b"d\0\0")
@@ -622,11 +558,11 @@ def selftest():
         assert is_random_case(nm) == want, nm
     rc = [(n, 5, 100.0 + 40 * i) for i, n in enumerate(
         ["NiNjahaWk", "ShADOWNHaWk", "FrOsTeagle", "siLEnTpaNDA", "EPiCreApER", "wiLDBAndIT", "Bob", "Alice", "Carl", "Dave"])]
-    assert padding_size(parse_a2s_info(info_pkt("c", 10, 32)), parse_a2s_players(players_pkt(rc))) == 6
+    assert _pad_count(parse_a2s_info(info_pkt("c", 10, 32)), parse_a2s_players(players_pkt(rc))) == 6
     # padded servers: default is to show the real count, padding only dropped on request
     assert players_reason(parse_a2s_info(info_pkt("f2", 31, 32)), parse_a2s_players(players_pkt(l2)), drop_padding=False) is None
-    assert padding_size(parse_a2s_info(info_pkt("f2", 31, 32)), parse_a2s_players(players_pkt(l2))) == 16
-    assert padding_size(parse_a2s_info(info_pkt("ok", 14, 32)), parse_a2s_players(players_pkt(l2[:14]))) == 0
+    assert _pad_count(parse_a2s_info(info_pkt("f2", 31, 32)), parse_a2s_players(players_pkt(l2))) == 16
+    assert _pad_count(parse_a2s_info(info_pkt("ok", 14, 32)), parse_a2s_players(players_pkt(l2[:14]))) == 0
     rp = rewrite_info_players(info_pkt("f2", 31, 32), 14)
     ri = parse_a2s_info(rp)
     assert ri["players"] == 14 and ri["max_players"] == 32 and ri["name"] == "f2" and ri["map"] == "de_dust2"
@@ -637,24 +573,21 @@ def selftest():
            3197, 2941, 3277, 3126, 3142, 2936, 3191]
     steps = [176, 187, 198, 209, 220, 11, 22, 33]
     l4 = [(f"f{i}", 1, float(x)) for i, x in enumerate(blk + steps)]
-    assert padding_size(parse_a2s_info(info_pkt("z", 63, 64)), parse_a2s_players(players_pkt(l4))) == len(l4)
+    assert _pad_count(parse_a2s_info(info_pkt("z", 63, 64)), parse_a2s_players(players_pkt(l4))) == len(l4)
     # real list never has equal-step runs flagged without a cluster
-    assert padding_size(parse_a2s_info(info_pkt("ok", 14, 32)), parse_a2s_players(players_pkt(
+    assert _pad_count(parse_a2s_info(info_pkt("ok", 14, 32)), parse_a2s_players(players_pkt(
         [(f"s{i}", 1, float(x)) for i, x in enumerate([10, 20, 30, 40, 50, 60, 70, 500])]))) == 0
     d = DupTracker(max_same_name=3, max_per_ip=10)
     assert d.check(("1.1.1.1", 1), "Free Skins") is None
     assert d.check(("1.1.1.2", 1), "free  skins") is None
     assert "seen on 3" in d.check(("1.1.1.3", 1), "FREE SKINS")
     d3 = DupTracker(3, 10)
-    d3.file = "x.txt"  # enable in-memory blocking without touching disk
-    d3._block = lambda ips: d3.bad_ips.update(ips)
     assert d3.check(("9.9.9.9", 27015), "TACTICA.GG DM #1") is None
     assert d3.check(("9.9.9.9", 27016), "TACTICA.GG DM #2") is None
     assert d3.check(("9.9.9.9", 27017), "TACTICA.GG DM #3") is None  # same IP: legit host
     assert d3.check(("1.1.1.1", 27015), "➥ FB-CS.RU | DUST2 #1") is None
     assert d3.check(("2.2.2.2", 27015), "➥ FB-CS.RU | DUST2 #2") is None
     assert "3 different IPs" in d3.check(("3.3.3.3", 27015), "➥ FB-CS.RU | DUST2 #7")
-    assert "flagged as a spam farm" in d3.check(("1.1.1.1", 27099), "anything")
     d2 = DupTracker(3, 2)
     d2.check(("2.2.2.2", 1), "a"); d2.check(("2.2.2.2", 2), "b")
     assert "3 ports" in d2.check(("2.2.2.2", 3), "c")
@@ -670,12 +603,6 @@ def selftest():
     assert "answers from 2" in st.check(("5.6.7.8", 27015), ei["steamid"])
     dupnames = parse_a2s_players(players_pkt([("a", 1, 1.0), ("a", 2, 2.0), ("a", 3, 3.0), ("b", 4, 4.0), ("c", 5, 5.0)]))
     assert "unique names" in players_reason(parse_a2s_info(info_pkt("x", 5, 64)), dupnames)
-    ns = NameShare(2, 0.5)
-    pool = ["w", "x", "y", "z", "q"]
-    assert ns.check(("1.1.1.1", 1), pool) is None
-    assert ns.check(("1.1.1.2", 1), pool) is None
-    assert "also on other servers" in ns.check(("1.1.1.3", 1), pool)  # 2 other servers share them
-    assert ns.check(("9.9.9.9", 1), ["u1", "u2", "u3", "u4"]) is None
     assert strip_name("➥███ FB-CS.RU | DUST2 #1 ✪🔥") == "FB-CS.RU | DUST2 #1", strip_name("➥███ FB-CS.RU | DUST2 #1 ✪🔥")
     assert strip_name("Rīga Server «LV»") == "Rīga Server «LV»"
     assert strip_name("日本 サーバー") == "日本 サーバー"
@@ -694,39 +621,54 @@ def selftest():
 
 
 # ------------------------------------------------------------------- main
+MAX_PLAYERS = 64     # largest believable max-player count
+PROBE_TIMEOUT = 1.0  # seconds to wait per A2S_PLAYER step
+CACHE_TTL = 300      # seconds a probe result is remembered
+MAX_SAME_NAME = 3    # the same server name on this many different IPs = spam
+MAX_PER_IP = 10      # more ports than this on one IP = spam farm
 RULE_KEYS = ["port", "sanity", "mismatch", "names", "padding", "identity", "steamid", "dups"]
 
 
-def csv_set(text):
-    return {x.strip().upper() if x.strip().isalpha() and len(x.strip()) == 2 else x.strip()
-            for x in (text or "").replace(";", ",").split(",") if x.strip()}
+@dataclass
+class Config:
+    disabled: set = field(default_factory=set)         # RULE_KEYS to switch off
+    port_range: tuple = (26000, 28999)                 # None = any port
+    padded: str = "show"                               # servers with fake players: "show" real count | "drop"
+    tidy_names: bool = True                            # uniform "flag Mode | Name" style
+    country_prefix: bool = True                        # real country in front of the name
+    flag_style: str = "emoji"                          # "emoji" or "text" ([LV])
+    block_countries: set = field(default_factory=set)  # hide servers from these countries
+    allow_countries: set = field(default_factory=set)  # if set, show ONLY these countries
+    geo_file: str = field(default_factory=lambda: asset_path("geo", "dbip.csv.gz"))
 
 
-def run(a, out=None, handle_box=None):
-    """Run the filter until Ctrl+C (CLI) or until handle_box['w'].close() (GUI)."""
+def parse_port_range(text):
+    """'26000-28999' -> (26000, 28999); 'any' -> None. Raises ValueError on anything else."""
+    text = text.strip().lower()
+    if text in ("", "any"):
+        return None
+    lo, hi = (int(x) for x in text.split("-"))
+    return lo, hi
+
+
+def run(cfg, out=None, handle_box=None):
+    """Filter until Ctrl+C (CLI) or until handle_box['w'].close() (GUI)."""
     import pydivert  # imported late so --selftest works without it
     out = out or (lambda s: print(s, flush=True))
-    off = set(a.disable) if not isinstance(a.disable, str) else csv_set(a.disable.lower())
-    block_cc = {c.upper() for c in (csv_set(a.block_countries) if isinstance(a.block_countries, str) else a.block_countries)}
-    allow_cc = {c.upper() for c in (csv_set(a.allow_countries) if isinstance(a.allow_countries, str) else a.allow_countries)}
-
+    off = cfg.disabled
+    block_cc, allow_cc = cfg.block_countries, cfg.allow_countries
     prober = Prober()
-    dups = DupTracker(a.max_same_name, a.max_per_ip,
-                      None if a.no_blocklist else a.blocklist)
+    dups = DupTracker(MAX_SAME_NAME, MAX_PER_IP)
     geo = None
-    if (a.rewrite and not a.no_flags) or block_cc or allow_cc:
+    if cfg.country_prefix or block_cc or allow_cc:
         try:
-            geo = GeoDB(a.geo_file)
+            geo = GeoDB(cfg.geo_file)
             out(f"loaded {len(geo.starts)} country ranges")
         except OSError as e:
             out(f"no country database ({e}); no flags / country rules")
-    port_range = None
-    if "port" not in off and a.port_range.lower() != "any":
-        lo, hi = a.port_range.split("-")
-        port_range = (int(lo), int(hi))
-    shares = NameShare(a.share_servers, a.share_fraction)
+    port_range = None if "port" in off else cfg.port_range
     steamids = SteamIdTracker()
-    cache = {}  # addr -> (expires, reason_or_None, names) from sanity+probe (static part)
+    cache = {}  # addr -> (expires, reason_or_None, real_count_or_None)
     stats = {"seen": 0, "dropped": 0}
     send_lock = threading.Lock()
     pool = ThreadPoolExecutor(max_workers=64)
@@ -739,71 +681,64 @@ def run(a, out=None, handle_box=None):
             f"{info['max_players']} '{info['name'][:40]}' ({why})")
 
     def static_verdict(addr, info):
-        """Return (reason_or_None, player_names, real_player_count_or_None)."""
-        why = None if "sanity" in off else sanity_reason(info, a.max_valid)
-        if why or a.no_probe:
-            return why, [], None
-        kind, plist = prober.players(addr, a.timeout)
-        if a.dump_ip and addr[0] == a.dump_ip:
-            out(f"--- DUMP {addr} INFO={info} probe={kind}")
-            for p in plist or []:
-                out(f"    {p}")
-        if kind == "none":
-            return ("no A2S_PLAYER response" if a.strict else None), [], None
-        if kind == "ok":
-            why = players_reason(info, plist, drop_padding=a.padded == "drop", skip=off)
-            pad = 0 if (why or "padding" in off) else padding_size(info, plist)
-            real = max(0, len(plist) - pad) if pad else None
-            if pad and real == 0:  # nobody real in there: the whole server is a decoy
-                why = f"all {len(plist)} listed players are fake padding"
-            return why, [p[0] for p in plist], real
-        return None, [], None
+        """Return (reason_or_None, real_player_count_or_None) from the sanity rules + the probe."""
+        why = None if "sanity" in off else sanity_reason(info, MAX_PLAYERS)
+        if why:
+            return why, None
+        kind, plist = prober.players(addr, PROBE_TIMEOUT)
+        if kind != "ok":
+            return None, None
+        why = players_reason(info, plist, drop_padding=cfg.padded == "drop", skip=off)
+        pad = 0 if (why or "padding" in off) else len(padding_indices(info, plist))
+        real = max(0, len(plist) - pad) if pad else None
+        if pad and real == 0:  # nobody real in there: the whole server is a decoy
+            why = f"all {len(plist)} listed players are fake padding"
+        return why, real
+
+    def new_name(addr, info):
+        cc = geo.country(addr[0]) if geo else ""
+        flag = flag_text(cc, cfg.flag_style) if geo and cfg.country_prefix else ""
+        if cfg.tidy_names:
+            # tags like [LV] are only removed when we know the real country
+            codes = set(geo.ccs) if flag else None
+            badge = "[WS]" if cfg.flag_style == "text" else "\U0001F3A8"
+            mode, rest = simplify_name(info["name"], info["map"], codes, True, badge)
+            return f"{flag} {mode} | {rest}".strip()
+        return f"{flag} {info['name']}".strip()
 
     def decide(w, pkt, addr, info):
-        hit = cache.get(addr)
-        real = None
         cc = geo.country(addr[0]) if geo else ""
+        real = None
+        hit = cache.get(addr)
         if cc and cc in block_cc:
-            why, names = f"country {cc} is blocked", []
+            why = f"country {cc} is blocked"
         elif allow_cc and cc not in allow_cc:
-            why, names = f"country {cc or '??'} not in allowed list", []
+            why = f"country {cc or '??'} not in allowed list"
         elif port_range and not (port_range[0] <= addr[1] <= port_range[1]):
-            why, names = f"port {addr[1]} outside {a.port_range}", []
+            why = f"port {addr[1]} outside {port_range[0]}-{port_range[1]}"
         elif hit and hit[0] > time.time():
-            why, names, real = hit[1], hit[2], hit[3]
+            _, why, real = hit
         else:
-            why, names, real = static_verdict(addr, info)
-            cache[addr] = (time.time() + a.cache_ttl, why, names, real)
+            why, real = static_verdict(addr, info)
+            cache[addr] = (time.time() + CACHE_TTL, why, real)
         why = (why or (None if "identity" in off else identity_reason(addr, info))
                or (None if "steamid" in off else steamids.check(addr, info["steamid"]))
-               or (None if "dups" in off else dups.check(addr, info["name"]))
-               or (shares.check(addr, names) if a.shared_names else None))
+               or (None if "dups" in off else dups.check(addr, info["name"])))
         if why:
             stats["dropped"] += 1
-            log("DROP      " if a.enforce else "would drop", addr, info, why)
-            if a.enforce:
-                return
-        if real is not None and not why:
-            log("ADJUST    " if a.enforce else "would adjust", addr, info, f"showing {real} real players instead")
+            log("DROP      ", addr, info, why)
+            return
+        if real is not None:
+            log("ADJUST    ", addr, info, f"showing {real} real players instead")
             try:
                 pkt.payload = rewrite_info_players(bytes(pkt.payload), real)
             except Exception as e:
                 out(f"player-count rewrite failed: {e!r}")
-        if a.rewrite:
+        if cfg.tidy_names or cfg.country_prefix:
             try:
-                cc_here = geo.country(addr[0]) if geo else ""
-                flag = flag_text(cc_here, a.flag_style) if geo else ""
-                if getattr(a, "simplify", True):
-                    # tags like [LV] are only removed when we know the real country
-                    codes = set(geo.ccs) if flag else None
-                    badge = "[WS]" if a.flag_style == "text" else "\U0001F3A8"
-                    mode, rest = simplify_name(info["name"], info["map"], codes, not a.keep_emoji, badge)
-                    new = f"{flag} {mode} | {rest}".strip()
-                else:
-                    name = info["name"] if a.keep_emoji else strip_name(info["name"])
-                    new = f"{flag} {name}".strip() if flag else name
-                if new != info["name"]:
-                    pkt.payload = rewrite_info_name(bytes(pkt.payload), new)
+                name = new_name(addr, info)
+                if name != info["name"]:
+                    pkt.payload = rewrite_info_name(bytes(pkt.payload), name)
             except Exception as e:  # never lose a reply because of cosmetics
                 out(f"rewrite failed: {e!r}")
         try:
@@ -812,77 +747,27 @@ def run(a, out=None, handle_box=None):
         except Exception:
             pass  # handle closed while a held reply was still being checked
 
-    out(f"{'ENFORCING' if a.enforce else 'DRY-RUN'}; max slots {a.max_valid}, "
-        f"probe={'off' if a.no_probe else 'on'}{' strict' if a.strict else ''}, "
-        f"dup name>={a.max_same_name}, ports/ip>{a.max_per_ip}, off={sorted(off)}, "
-        f"block={sorted(block_cc)}, allow={sorted(allow_cc)}.")
+    out(f"Filtering on. off={sorted(off)}, block={sorted(block_cc)}, allow={sorted(allow_cc)}.")
     with pydivert.WinDivert(flt) as w:
         if handle_box is not None:
             handle_box["w"] = w
         try:
             for pkt in w:
-                if pkt.dst_port == prober.port:  # reply to our own probe: let it through
-                    with send_lock:
-                        w.send(pkt)
-                    continue
-                info = parse_a2s_info(pkt.payload or b"")
-                if info is None:
+                info = None if pkt.dst_port == prober.port else parse_a2s_info(pkt.payload or b"")
+                if info is None:  # not an A2S_INFO reply (or the reply to our own probe): let it through
                     with send_lock:
                         w.send(pkt)
                     continue
                 stats["seen"] += 1
-                addr = (pkt.src_addr, pkt.src_port)
-                pool.submit(decide, w, pkt, addr, info)
+                pool.submit(decide, w, pkt, (pkt.src_addr, pkt.src_port), info)
         except KeyboardInterrupt:
             pass
         except Exception:
             if handle_box is None:
-                raise  # CLI: real error. GUI: handle was closed by Stop.
-    out(f"A2S_INFO replies seen: {stats['seen']}, flagged: {stats['dropped']}")
+                raise  # CLI: real error. GUI: the handle was closed by Pause/Quit.
+    out(f"A2S_INFO replies seen: {stats['seen']}, hidden: {stats['dropped']}")
     pool.shutdown(wait=False)
 
 
-def build_parser():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--enforce", action="store_true", help="drop fake replies (default: log only)")
-    ap.add_argument("--max-valid", type=int, default=64, help="largest believable max players (CS2: 64)")
-    ap.add_argument("--no-probe", action="store_true", help="skip the A2S_PLAYER validation")
-    ap.add_argument("--strict", action="store_true", help="also drop servers that never answer A2S_PLAYER")
-    ap.add_argument("--timeout", type=float, default=1.0, help="seconds to wait per probe step")
-    ap.add_argument("--cache-ttl", type=float, default=300, help="seconds to remember a probe result")
-    ap.add_argument("--max-same-name", type=int, default=3, help="drop when this many addresses share a name")
-    ap.add_argument("--max-per-ip", type=int, default=10, help="drop when an IP advertises more ports than this")
-    ap.add_argument("--blocklist", default="blocked_ips.txt",
-                    help="file remembering flagged spam-farm IPs between runs (delete it to reset)")
-    ap.add_argument("--no-blocklist", action="store_true", help="don't load/save the blocklist")
-    ap.add_argument("--padded", choices=["show", "drop"], default="show",
-                    help="servers with fake padded players: 'show' with the real count (default) or 'drop'")
-    ap.add_argument("--no-rewrite", dest="rewrite", action="store_false",
-                    help="don't touch server names (no emoji strip, no flag)")
-    ap.add_argument("--keep-emoji", action="store_true", help="don't strip emoji from names")
-    ap.add_argument("--no-simplify", dest="simplify", action="store_false",
-                    help="don't rewrite names into the uniform 'flag Mode | Name' style")
-    ap.add_argument("--no-flags", action="store_true", help="don't add a country prefix")
-    ap.add_argument("--flag-style", choices=["emoji", "text"], default="emoji",
-                    help="'emoji' = flag emoji, 'text' = [LV] (Steam on Windows often shows emoji flags as letters)")
-    ap.add_argument("--geo-file", default=asset_path("geo", "dbip.csv.gz"))
-    ap.add_argument("--port-range", default="26000-28999",
-                    help="only accept servers on ports in this range, e.g. 26000-28999; 'any' disables")
-    ap.add_argument("--shared-names", action="store_true",
-                    help="enable the copied-player-names check (off by default)")
-    ap.add_argument("--share-servers", type=int, default=2,
-                    help="a player name on this many OTHER servers counts as copied")
-    ap.add_argument("--share-fraction", type=float, default=0.5,
-                    help="drop when this fraction of a server's names are copied")
-    ap.add_argument("--dump-ip", default="", help="print INFO and full player list for this server IP")
-    ap.add_argument("--block-countries", default="", help="comma list of country codes to hide, e.g. RU,CN")
-    ap.add_argument("--allow-countries", default="", help="if set, ONLY these country codes are shown")
-    ap.add_argument("--disable", default="",
-                    help="comma list of rules to switch off: " + ",".join(RULE_KEYS))
-    ap.add_argument("--selftest", action="store_true")
-    return ap
-
-
 if __name__ == "__main__":
-    a = build_parser().parse_args()
-    selftest() if a.selftest else run(a)
+    selftest() if "--selftest" in sys.argv else run(Config())

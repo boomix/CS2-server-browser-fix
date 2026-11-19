@@ -71,7 +71,7 @@ python src/a2s_gui.py                    # run the app (elevated)
 python build.py                          # builds release/CS2ServerFilter.exe and the zip
 ```
 
-Command-line version: `python src/a2s_filter.py --help` (run from an elevated terminal).
+Engine only, no window: `python src/a2s_filter.py` from an elevated terminal (default settings).
 
 ## Credits
 

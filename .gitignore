@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+release/
+*.spec
+prev_*.png
+gui_preview.png
+blocked_ips.txt
+settings.json

@@ -6,6 +6,20 @@ Open the browser, refresh, and see real servers instead of lists full of `255/25
 
 <p align="center"><img src="assets/icon.png" width="96" alt="icon"></p>
 
+## Before and after
+
+Steam's server list for Counter-Strike 2, sorted by players. Same list, same moment:
+
+| Without the filter | With the filter |
+|:---:|:---:|
+| ![Before: every server shows 255/255 players](docs/before.png) | ![After: real servers with real player counts, tidy names and country](docs/after.png) |
+| Fake servers fill the top with `255/255` | Real servers with real player counts |
+
+## The app
+
+<p align="center"><img src="docs/app.png" width="560" alt="CS2 Server Browser Fix window"></p>
+
+
 ## Features
 
 - **Hides fake servers**: impossible player numbers (`255/255`, more players than slots), padded player lists, copies of one server on many ports, spam farms and servers on odd ports.
